@@ -13,9 +13,9 @@ func main() {
 		// In a real application, you'd perform authentication here
 		// and get a reliable UserID from a session or token.
 		// For this example, we'll use a query parameter.
-		userID := r.URL.Query().Get("userID")
+		userID := r.Header.Get("Phone-Number")
 		if userID == "" {
-			http.Error(w, "userID query parameter is required", http.StatusBadRequest)
+			http.Error(w, "Phone-Number is required", http.StatusBadRequest)
 			return
 		}
 
