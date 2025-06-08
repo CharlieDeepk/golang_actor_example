@@ -136,6 +136,7 @@ func (u *UserActor) readPump() {
 		switch clientMsg.Type {
 		case "chat_message":
 			// Forward the message to the ServerActor for routing
+			//this case is for one to one chat
 			payload, _ := json.Marshal(struct { // Include sender info in payload
 				Sender string `json:"sender"`
 				Text   string `json:"text"`
@@ -149,6 +150,18 @@ func (u *UserActor) readPump() {
 				UserID:  clientMsg.Recipient, // Recipient is the target ID
 				Payload: payload,
 			})
+			break
+		case "group_message":
+			// Forward the message to the server actor for routing
+			//this is case is for group message
+			payload, _ := json.Marshal(struct {
+				Sender string `json:"sender"`
+				Text   string `json:"text"`
+			}{
+				Sender: u.id,
+				Text:   clientMsg.Text,
+			})
+			log.Printf("UserActor %s: sent message in group: %v", u.id, payload)
 		default:
 			log.Printf("UserActor %s: Unhandled client message type: %s\n", u.id, clientMsg.Type)
 		}

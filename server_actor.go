@@ -84,6 +84,7 @@ func (s *ServerActor) handleServerMessage(msg ServerMessage) {
 	case MessageTypeUserChat: // This is a message from a user to another user, forwarded by the ServerActor
 		targetUserInbox, found := s.connectedUsers[msg.UserID] // msg.UserID here is the target
 		if found {
+			// it means user is online/connected to server
 			log.Printf("ServerActor: Forwarding chat from %s to %s\n", msg.Payload, msg.UserID) // Payload should contain sender info
 			targetUserInbox <- UserMessage{
 				Type: MessageTypeUserChat,
@@ -93,6 +94,8 @@ func (s *ServerActor) handleServerMessage(msg ServerMessage) {
 			}
 		} else {
 			log.Printf("ServerActor: Target user %s not found. Message dropped.\n", msg.UserID)
+			// it means user is offline/disconnected from the server
+			// if failed load message to buffer/kv store
 			// In a real app, you'd send an error back to the sender
 		}
 	default:
