@@ -1,237 +1,189 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// ClientMessage (what we expect from the client via WebSocket)
-type ClientMessage struct {
-	Type      string `json:"type"`
-	Recipient string `json:"recipient"` // For one-to-one chat
-	Text      string `json:"text"`
-	// ... other fields like "session_token" for auth
-}
+// // ClientMessage (what we expect from the client via WebSocket)
+// type ClientMessage struct {
+// 	Type      string `json:"type"`
+// 	Recipient string `json:"recipient"` // For one-to-one chat
+// 	Text      string `json:"text"`
+// 	// ... other fields like "session_token" for auth
+// }
 
-// ServerOutgoingMessage (what we send back to the client via WebSocket)
-type ServerOutgoingMessage struct {
-	Type   string `json:"type"`
-	Sender string `json:"sender,omitempty"`
-	Text   string `json:"text,omitempty"`
-	Status string `json:"status,omitempty"` // For user status updates
-}
+// // ServerOutgoingMessage (what we send back to the client via WebSocket)
+// type ServerOutgoingMessage struct {
+// 	Type   string `json:"type"`
+// 	Sender string `json:"sender,omitempty"`
+// 	Text   string `json:"text,omitempty"`
+// 	Status string `json:"status,omitempty"` // For user status updates
+// }
 
 // UserActor represents a connected user.
 type UserActor struct {
-	serverActor *ServerActor               // Reference to the main ServerActor
-	conn        *websocket.Conn            // The WebSocket connection for this user
-	id          string                     // Unique user ID (e.g., username)
-	inbox       chan UserMessage           // Channel for messages directed to this user
-	writeChan   chan ServerOutgoingMessage // Channel to write messages to the WebSocket
-	quit        chan struct{}              // Signal for user to stop
+	ID         string                     // Unique user ID (e.g., username)
+	Conn       *websocket.Conn            // The WebSocket connection for this user
+	ServerChan chan<- UserToServerMessage // Channel to send messages to the Server Actor
+	Inbox      chan ServerToUserMessage   // Channel to receive messages from Server/GroupChatActors
+	StopChan   chan struct{}              // Signal for user to stop
+	Wg         sync.WaitGroup
 }
 
 // NewUserActor creates and starts a new UserActor.
-func NewUserActor(serverActor *ServerActor, conn *websocket.Conn, userID string) *UserActor {
+func NewUserActor(serverChan chan<- UserToServerMessage, conn *websocket.Conn, userID string) *UserActor {
 	u := &UserActor{
-		serverActor: serverActor,
-		conn:        conn,
-		id:          userID,
-		inbox:       make(chan UserMessage),
-		writeChan:   make(chan ServerOutgoingMessage, 10), // Buffered channel for writes
-		quit:        make(chan struct{}),
+		ID:         userID,
+		Conn:       conn,
+		ServerChan: serverChan,
+		Inbox:      make(chan ServerToUserMessage, 100), //buffered channel
+		StopChan:   make(chan struct{}),
 	}
-	go u.start()
+	// go u.start()
 	return u
 }
 
 // Start the UserActor's message processing and I/O loops.
 func (u *UserActor) start() {
-	log.Printf("UserActor for %s started...\n", u.id)
+	u.Wg.Add(2) // for read and write goroutine
 
-	// Register with the ServerActor
-	resp := make(chan error)
-	u.serverActor.SendMessage(ServerMessage{
-		Type:    MessageTypeRegisterUser,
-		UserID:  u.id,
-		UserRef: u.inbox,
-		Resp:    resp,
-	})
-	if err := <-resp; err != nil {
-		log.Printf("Failed to register user %s: %v\n", u.id, err)
-		u.conn.Close()
-		return
-	}
+	// Goroutine to read messages from the WebSocket connection
+	go u.readPump()
+	// Goroutine to write messages from the WebSocket connection
+	go u.writePump()
 
-	var wg sync.WaitGroup
-	wg.Add(2) // One for reader, one for writer
+	log.Printf("UserActor for %s started...\n", u.ID)
+}
 
-	// Goroutine for reading messages from the WebSocket
-	go func() {
-		defer wg.Done()
-		u.readPump()
-	}()
+func (u *UserActor) Stop() {
+	log.Printf("Stopping UserActor %s...", u.ID)
+	close(u.StopChan)
+	u.Wg.Wait() // Wait for readPump and writePump to finish
+	u.Conn.Close()
+	log.Printf("UserActor %s stopped.", u.ID)
+}
 
-	// Goroutine for writing messages to the WebSocket
-	go func() {
-		defer wg.Done()
-		u.writePump()
-	}()
-
-	// Main actor loop for internal messages
-	for {
-		select {
-		case msg := <-u.inbox:
-			u.handleUserMessage(msg)
-		case <-u.quit:
-			log.Printf("UserActor for %s stopping...\n", u.id)
-			// Unregister from ServerActor
-			u.serverActor.SendMessage(ServerMessage{
-				Type:   MessageTypeUnregisterUser,
-				UserID: u.id,
-				Resp:   resp, // Re-use resp channel
-			})
-			if err := <-resp; err != nil {
-				log.Printf("Failed to unregister user %s: %v\n", u.id, err)
-			}
-			// Close WebSocket connection and channels
-			u.conn.Close()
-			close(u.inbox)
-			close(u.writeChan)
-			return
-		}
+func (u *UserActor) Send(msg ServerToUserMessage) {
+	select {
+	case u.Inbox <- msg:
+	case <-u.StopChan:
+		log.Printf("UserActor %s inbox is closed, message dropped.", u.ID)
+	default:
+		log.Printf("UserActor %s inbox is full, message dropped.", u.ID)
 	}
 }
 
 // readPump reads messages from the WebSocket and sends them to the ServerActor.
 func (u *UserActor) readPump() {
 	defer func() {
-		u.quit <- struct{}{} // Signal main actor loop to stop on disconnect
-		log.Printf("UserActor %s: Read pump stopped.\n", u.id)
+		u.Wg.Done()
+		log.Printf("UserActor %s: Read pump exiting.\n", u.ID)
+		// Notify server that this user disconnected
+		u.ServerChan <- UserToServerMessage{
+			FromUserID: u.ID,
+			Message: Message{
+				Type: "disconnect",
+				Payload: map[string]string{
+					"user_id": u.ID,
+				},
+			},
+		}
+
 	}()
-	u.conn.SetReadLimit(512)
-	u.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	u.conn.SetPongHandler(func(string) error { u.conn.SetReadDeadline(time.Now().Add(60 * time.Second)); return nil })
+	// u.Conn.SetReadLimit(512)
+	// u.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// u.Conn.SetPongHandler(func(string) error { u.conn.SetReadDeadline(time.Now().Add(60 * time.Second)); return nil })
 
 	for {
-		_, message, err := u.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("UserActor %s: Read error: %v\n", u.id, err)
-			}
-			break
-		}
-
-		var clientMsg ClientMessage
-		if err := json.Unmarshal(message, &clientMsg); err != nil {
-			log.Printf("UserActor %s: Failed to unmarshal client message: %v\n", u.id, err)
-			// Send an error back to client or log
-			continue
-		}
-
-		switch clientMsg.Type {
-		case "chat_message":
-			// Forward the message to the ServerActor for routing
-			//this case is for one to one chat
-			payload, _ := json.Marshal(struct { // Include sender info in payload
-				Sender string `json:"sender"`
-				Text   string `json:"text"`
-			}{
-				Sender: u.id,
-				Text:   clientMsg.Text,
-			})
-
-			u.serverActor.SendMessage(ServerMessage{
-				Type:    MessageTypeUserChat,
-				UserID:  clientMsg.Recipient, // Recipient is the target ID
-				Payload: payload,
-			})
-			break
-		case "group_message":
-			// Forward the message to the server actor for routing
-			//this is case is for group message
-			payload, _ := json.Marshal(struct {
-				Sender string `json:"sender"`
-				Text   string `json:"text"`
-			}{
-				Sender: u.id,
-				Text:   clientMsg.Text,
-			})
-			log.Printf("UserActor %s: sent message in group: %v", u.id, payload)
+		select {
+		case <-u.StopChan:
+			return
 		default:
-			log.Printf("UserActor %s: Unhandled client message type: %s\n", u.id, clientMsg.Type)
+			var msg Message
+			err := u.Conn.ReadJSON(&msg)
+			if err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Printf("UserActor %s websocket closed: %v", u.ID, err)
+				} else {
+					log.Printf("UserActor %s read error: %v", u.ID, err)
+				}
+				return
+			}
+			log.Printf("UserActor %s received from client: %+v", u.ID, msg)
+			u.ServerChan <- UserToServerMessage{
+				FromUserID: u.ID,
+				Message:    msg,
+			}
 		}
+
 	}
 }
 
-// writePump writes messages from the writeChan to the WebSocket.
+// writePump writes messages from the Inbox to the WebSocket connection
 func (u *UserActor) writePump() {
-	ticker := time.NewTicker(50 * time.Second) // Ping interval
+	// ticker := time.NewTicker(50 * time.Second) // Ping interval
 	defer func() {
-		ticker.Stop()
-		log.Printf("UserActor %s: Write pump stopped.\n", u.id)
+		// ticker.Stop()
+		u.Wg.Done()
+		log.Printf("UserActor %s: Write pump exiting.\n", u.ID)
 	}()
 
 	for {
 		select {
-		case message, ok := <-u.writeChan:
-			if !ok {
-				u.conn.WriteMessage(websocket.CloseMessage, []byte{}) // Channel closed
-				return
-			}
-			w, err := u.conn.NextWriter(websocket.TextMessage)
+		case msg := <-u.Inbox:
+			log.Printf("UserActor %s sending to client: %+v", u.ID, msg.Message)
+			err := u.Conn.WriteJSON(msg.Message)
 			if err != nil {
-				log.Printf("UserActor %s: Error getting writer: %v\n", u.id, err)
+				log.Printf("UserActor %s write error: %v", u.ID, err)
 				return
 			}
-			json.NewEncoder(w).Encode(message)
-			if err := w.Close(); err != nil {
-				log.Printf("UserActor %s: Error closing writer: %v\n", u.id, err)
-				return
-			}
-		case <-ticker.C:
-			// Send ping frame
-			if err := u.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("UserActor %s: Ping write error: %v\n", u.id, err)
-				return
-			}
-		case <-u.quit: // Listen for quit signal to stop writing
+
+		// case <-ticker.C:
+		// 	// Send ping frame
+		// 	if err := u.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+		// 		log.Printf("UserActor %s: Ping write error: %v\n", u.id, err)
+		// 		return
+		// 	}
+		case <-u.StopChan: // Listen for quit signal to stop writing
 			return
 		}
 	}
 }
 
-// handleUserMessage processes internal messages directed to this UserActor.
-func (u *UserActor) handleUserMessage(msg UserMessage) {
-	switch msg.Type {
-	case MessageTypeUserChat:
-		// This is an incoming chat message from another user
-		log.Printf("UserActor %s: Received chat from %s: %s\n", u.id, msg.SenderID, string(msg.Payload))
+//
+// completed til here
+//
 
-		var chatMsg struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(msg.Payload, &chatMsg); err != nil {
-			log.Printf("UserActor %s: Failed to unmarshal chat payload: %v\n", u.id, err)
-			return
-		}
+// // handleUserMessage processes internal messages directed to this UserActor.
+// func (u *UserActor) handleUserMessage(msg UserMessage) {
+// 	switch msg.Type {
+// 	case MessageTypeUserChat:
+// 		// This is an incoming chat message from another user
+// 		log.Printf("UserActor %s: Received chat from %s: %s\n", u.id, msg.SenderID, string(msg.Payload))
 
-		u.writeChan <- ServerOutgoingMessage{
-			Type:   "incoming_message",
-			Sender: msg.SenderID,
-			Text:   chatMsg.Text,
-		}
-	case MessageTypeConnect:
-		// Could send a "you are connected" message to the client
-		u.writeChan <- ServerOutgoingMessage{
-			Type:   "status",
-			Status: "connected",
-		}
-	default:
-		log.Printf("UserActor %s: Unknown message type: %s\n", u.id, msg.Type)
-	}
-}
+// 		var chatMsg struct {
+// 			Text string `json:"text"`
+// 		}
+// 		if err := json.Unmarshal(msg.Payload, &chatMsg); err != nil {
+// 			log.Printf("UserActor %s: Failed to unmarshal chat payload: %v\n", u.id, err)
+// 			return
+// 		}
+
+// 		u.writeChan <- ServerOutgoingMessage{
+// 			Type:   "incoming_message",
+// 			Sender: msg.SenderID,
+// 			Text:   chatMsg.Text,
+// 		}
+// 	case MessageTypeConnect:
+// 		// Could send a "you are connected" message to the client
+// 		u.writeChan <- ServerOutgoingMessage{
+// 			Type:   "status",
+// 			Status: "connected",
+// 		}
+// 	default:
+// 		log.Printf("UserActor %s: Unknown message type: %s\n", u.id, msg.Type)
+// 	}
+// }

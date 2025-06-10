@@ -1,25 +1,63 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
-// Message sent to UserActor
-type UserMessage struct {
-	Type     string // e.g., "connect", "disconnect", "chat", "send_to_user"
-	SenderID string // ID of the sender (user, or system)
-	TargetID string // ID of the target user (for one-to-one)
-	// Payload  interface{} // The actual data (e.g., chat text, connection info)
-	Payload json.RawMessage // Or interface{} for structured data
-	Resp    chan error      // Optional: for synchronous acknowledgements
+// genral msg
+type Message struct {
+	Type      string      `json:"type"` // like "chat", "group_action", "error"
+	Payload   interface{} `json:"payload"`
+	Timestamp time.Time   `json:"timestamp"`
 }
 
-// Message sent to ServerActor
-type ServerMessage struct {
-	Type    string           // e.g., "register_user", "unregister_user", "user_online", "user_offline"
-	UserID  string           // ID of the user involved
-	UserRef chan UserMessage // Reference to the user's inbox channel
-	// Payload interface{}      // Optional: additional data
-	Payload json.RawMessage // Or interface{} for structured data
-	Resp    chan error      // Optional: for synchronous acknowledgements
+// chat msg
+type ChatMessage struct {
+	SenderID string `json:"sender_id"`
+	Content  string `json:"content"`
+	GroupID  string `json:"group_id,omitempty"` // opt for group chat
+}
+
+// group action msg
+type GroupActionType string
+
+const (
+	CreateGroup GroupActionType = "create_group"
+	JoinGroup   GroupActionType = "join_group"
+	LeaveGroup  GroupActionType = "leave_group"
+)
+
+type GroupAction struct {
+	Action    GroupActionType `json:"action"`
+	UserID    string          `json:"user_id"`
+	GroupID   string          `json:"group_id"`
+	GroupName string          `json:"group_name,omitempty"` // For create group
+}
+
+// Message sent to UserActor from ServerActor
+type ServerToUserMessage struct {
+	FromActorID string // ID of the actor sending this (example: Server, GroupChatActor)
+	Message     Message
+}
+
+// Message sent to ServerActor from UserActor
+type UserToServerMessage struct {
+	FromUserID string // ID of the UserActor
+	Message    Message
+}
+
+// Message sent to server from GroupActor
+type GroupChatToServerMessage struct {
+	FromGroupID string // ID of the GroupActor
+	Message     Message
+}
+
+// Message sent to GroupActor from ServerActor
+// later modify ServerToGroupMessage: ServerToGroupChatMessage
+type ServerToGroupMessage struct {
+	FromActorID string // UserID of the sender to grp
+	Message     Message
 }
 
 // Helper to safely get string from json.RawMessage (assuming it's a string)
